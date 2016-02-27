@@ -68,16 +68,43 @@ class Redo
     dofiles = list_do_files(target).select { |bn, df| File.exist? df }
     deps = get_dependencies target
     unless deps.nil?
-
+      effective_do = deps[0][1]
+      puts "effective_do=", effective_do
+      ex_dos = list_do_files(target).take_while { |df| df[1] != effective_do }
+      ex_deps = ex_dos.map { |df| [:non_existing_dependency, df[1]] }
+      puts "ex_dos=", ex_deps
+      return collect (ex_deps + deps)
     end
     return :uptodate if dofiles.empty?
     return :conflicted if !dofiles.empty?
     raise "invalid dependency: #{target}"
   end
 
+  def uptodate2 target
+    case target[0]
+    when :non_existing_dependency
+      if File.exist? target[1]
+        return :outdated
+      else
+        return :uptodate
+      end
+
+    when :existing_dependency
+    end
+  end
+
+  def collect deps
+    return :uptodate if deps.nil?
+
+    r = uptodate2 deps[0]
+    return r unless r == :uptodate
+
+    return collect deps.drop 1
+  end
+
   def redo_for_ target
     puts "visit #{target}"
-    return if up_to_date target
+    return if up_to_date(target) == :uptodate
 
     dofiles = list_do_files(target).select { |bn, df| File.exist? df }
     abort "no dofiles found." if dofiles.empty?
@@ -105,7 +132,7 @@ class Redo
     r = system(env, "sh", "-ve", "#{dofile[1]}", "#{dofile[0]}", "#{dofile[0]}", "#{tmp_out}")
     if r
       FileUtils.mv tmp_out, target, :force => true
-      FileUtils.mv tmp_deps, File.join(@deps_dir, target), :force => true
+      FileUtils.mv tmp_deps, File.join(@deps_dir, Base64.encode64(target).strip), :force => true
     else
       FileUtils.rm_f [tmp_out, tmp_deps]
       raise "#{dofile[1]} failed."
