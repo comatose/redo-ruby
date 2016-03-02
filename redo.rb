@@ -7,23 +7,39 @@ require 'yaml'
 require 'digest'
 require 'base64'
 
+module Settings
+  REDO_CALL_DEPTH = "REDO_CALL_DEPTH"
+  CALL_DEPTH = ENV.fetch(REDO_CALL_DEPTH, 0).to_i
+
+  REDO_DEPS_PATH = "REDO_DEPS_PATH"
+  DEPS_PATH = ENV[REDO_DEPS_PATH]
+
+  REDO_SESSION_ID = "REDO_SESSION_ID"
+  SESSION_ID = ENV.fetch(REDO_SESSION_ID, Process.pid).to_i
+
+  CONFIG_DIR = ".redo"
+  TEMP_DIR = File.join CONFIG_DIR, "temp", SESSION_ID.to_s
+  TEMP_OUT_DIR = File.join TEMP_DIR, "out"
+  DEPS_DIR = File.join CONFIG_DIR, "deps"
+
+  def Settings.encode_path file
+    Base64.encode64(file).strip
+  end
+
+  def Settings.spawned_env tmp_deps_path
+    {REDO_DEPS_PATH => tmp_deps_path,
+     REDO_CALL_DEPTH => "#{CALL_DEPTH + 1}"}
+  end
+
+  def Settings.file_signature file
+    Digest::MD5.file(file).to_s
+  end
+end
+
 class Redo
   def initialize files
     @targets = files.map { |f| redo_target_from_dir(Dir.pwd, f) }
 
-    @REDO_CALL_DEPTH = "REDO_CALL_DEPTH"
-    @call_depth = ENV.fetch(@REDO_CALL_DEPTH, 0).to_i
-
-    @REDO_DEPS_PATH = "REDO_DEPS_PATH"
-    @deps_path = ENV[@REDO_DEPS_PATH]
-
-    @REDO_SESSION_ID = "REDO_SESSION_ID"
-    @session_id = ENV.fetch(@REDO_SESSION_ID, Process.pid).to_i
-
-    @config_dir = ".redo"
-    @temp_dir = File.join @config_dir, "temp", @session_id.to_s
-    @temp_out_dir = File.join @temp_dir, "out"
-    @deps_dir = File.join @config_dir, "deps"
   end
 
   def list_do_files target
@@ -46,18 +62,18 @@ class Redo
   end
 
   def run
-    FileUtils.mkdir_p @temp_out_dir
-    FileUtils.mkdir_p @deps_dir
+    FileUtils.mkdir_p Settings::TEMP_OUT_DIR
+    FileUtils.mkdir_p Settings::DEPS_DIR
     begin
       @targets.each { |t| redo_for_ t }
     rescue Exception => e
       abort e.to_s
     end
-    FileUtils.rm_rf @temp_dir
+    FileUtils.rm_rf Settings::TEMP_DIR
   end
 
   def get_dependencies target
-    dep_file_name = File.join(@deps_dir, Base64.encode64(target).strip)
+    dep_file_name = File.join(Settings::DEPS_DIR, Settings.encode_path(target))
     return nil unless File.exist? dep_file_name
     File.open(dep_file_name, "r") { |file| YAML::load_file dep_file_name }
   end
@@ -69,10 +85,8 @@ class Redo
     deps = get_dependencies target
     unless deps.nil?
       effective_do = deps[0][1]
-      puts "effective_do=", effective_do
       ex_dos = list_do_files(target).take_while { |df| df[1] != effective_do }
       ex_deps = ex_dos.map { |df| [:non_existing_dependency, df[1]] }
-      puts "ex_dos=", ex_deps
       return collect (ex_deps + deps)
     end
     return :uptodate if dofiles.empty?
@@ -80,7 +94,7 @@ class Redo
     raise "invalid dependency: #{target}"
   end
 
-  def uptodate2 target
+  def up_to_date2 target
     case target[0]
     when :non_existing_dependency
       if File.exist? target[1]
@@ -90,28 +104,38 @@ class Redo
       end
 
     when :existing_dependency
+      if !File.exist?(target[1]) ||
+         target[2] != Settings::file_signature(target[1])
+        return :outdated
+      else
+        return up_to_date target[1]
+      end
     end
   end
 
   def collect deps
-    return :uptodate if deps.nil?
+    return :uptodate if deps.nil? || deps.empty?
 
-    r = uptodate2 deps[0]
+    r = up_to_date2 deps[0]
     return r unless r == :uptodate
 
     return collect deps.drop 1
   end
 
   def redo_for_ target
-    puts "visit #{target}"
-    return if up_to_date(target) == :uptodate
+    indent = ' ' * Settings::CALL_DEPTH
+    puts "visit #{indent + target}"
+    r = up_to_date(target)
+    puts "#{target} status = #{r}"
+    return if r == :uptodate
 
     dofiles = list_do_files(target).select { |bn, df| File.exist? df }
     abort "no dofiles found." if dofiles.empty?
 
     run_do target, dofiles[0]
 
-    add_dependency @deps_path, [:existing_dependency, target, Digest::MD5.file(target).to_s]
+    add_dependency Settings::DEPS_PATH, [:existing_dependency, target,
+                                         Settings::file_signature(target)]
   end
 
   def add_dependency dep_file, dep
@@ -124,15 +148,16 @@ class Redo
   end
 
   def run_do target, dofile
-    tmp_out = File.join @temp_dir, target
-    tmp_deps = Tempfile.new target, @tmp_out_dir
+    tmp_out = File.join Settings::TEMP_DIR, target
+    tmp_deps = Tempfile.new target, Settings::TEMP_OUT_DIR
     p "sh -vxe \"#{dofile[1]}\" \"#{dofile[0]}\" \"#{dofile[0]}\" \"#{tmp_out}\""
-    env = {@REDO_DEPS_PATH => tmp_deps.path, @REDO_CALL_DEPTH => "#{@call_depth + 1}"}
-    add_dependency tmp_deps, [:existing_dependency, dofile[1], Digest::MD5.file(dofile[1]).to_s]
-    r = system(env, "sh", "-ve", "#{dofile[1]}", "#{dofile[0]}", "#{dofile[0]}", "#{tmp_out}")
+    add_dependency tmp_deps, [:existing_dependency, dofile[1],
+                              Settings::file_signature(dofile[1])]
+    r = system(Settings.spawned_env(tmp_deps.path), "sh", "-ve",
+               "#{dofile[1]}", "#{dofile[0]}", "#{dofile[0]}", "#{tmp_out}")
     if r
       FileUtils.mv tmp_out, target, :force => true
-      FileUtils.mv tmp_deps, File.join(@deps_dir, Base64.encode64(target).strip), :force => true
+      FileUtils.mv tmp_deps, File.join(Settings::DEPS_DIR, Settings.encode_path(target)), :force => true
     else
       FileUtils.rm_f [tmp_out, tmp_deps]
       raise "#{dofile[1]} failed."
