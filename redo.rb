@@ -7,6 +7,16 @@ require 'yaml'
 require 'digest'
 require 'base64'
 
+def list_do_files target
+  tokens = target.split('.')
+  results = []
+  for i in 1..tokens.length-1
+    results += [[tokens[0...i].join('.'), tokens[i...tokens.length]]]
+  end
+  [[target, "#{File.basename target}.do"]] + \
+  results.map { |basename, dofile| [basename, (["default"] + dofile + ["do"]).join('.')] }
+end
+
 module Settings
   REDO_CALL_DEPTH = "REDO_CALL_DEPTH"
   CALL_DEPTH = ENV.fetch(REDO_CALL_DEPTH, 0).to_i
@@ -36,20 +46,76 @@ module Settings
   end
 end
 
+class Dependency
+  attr_accessor :target
+
+  def get_dependencies
+    dep_file_name = File.join(Settings::DEPS_DIR, Settings.encode_path(@target))
+    return nil unless File.exist? dep_file_name
+    File.open(dep_file_name, "r") { |file| YAML::load_file dep_file_name }
+  end
+
+  def up_to_date
+    p "check #{@target}\n"
+    return :outdated unless File.exist? @target
+
+    dofiles = list_do_files(@target).select { |bn, df| File.exist? df }
+    deps = get_dependencies
+    unless deps.nil?
+      effective_do = deps[0].target
+      ex_dos = list_do_files(@target).take_while { |df| df[1] != effective_do }
+      ex_deps = ex_dos.map { |df| NonExistingDependency.new df[1] }
+      return collect (ex_deps + deps)
+    end
+    return :uptodate if dofiles.empty?
+    return :conflicted if !dofiles.empty?
+    raise "invalid dependency: #{@target}"
+  end
+
+  def collect deps
+    return :uptodate if deps.nil? || deps.empty?
+
+    r = deps[0].up_to_date2
+    return r unless r == :uptodate
+
+    return collect deps.drop 1
+  end
+end
+
+class ExistingDependency < Dependency
+  def initialize target, signature
+    @target = target
+    @signature = signature
+  end
+
+  def up_to_date2
+    if !File.exist?(@target) ||
+       @signature != Settings::file_signature(@target)
+      return :outdated
+    else
+      return up_to_date
+    end
+  end
+end
+
+class NonExistingDependency < Dependency
+  def initialize target
+    @target = target
+  end
+
+  def up_to_date2
+    if File.exist? target
+      return :outdated
+    else
+      return :uptodate
+    end
+  end
+end
+
 class Redo
   def initialize files
     @targets = files.map { |f| redo_target_from_dir(Dir.pwd, f) }
 
-  end
-
-  def list_do_files target
-    tokens = target.split('.')
-    results = []
-    for i in 1..tokens.length-1
-      results += [[tokens[0...i].join('.'), tokens[i...tokens.length]]]
-    end
-    [[target, "#{File.basename target}.do"]] + \
-    results.map { |basename, dofile| [basename, (["default"] + dofile + ["do"]).join('.')] }
   end
 
   def redo_target_from_dir(base_dir, target)
@@ -72,60 +138,10 @@ class Redo
     FileUtils.rm_rf Settings::TEMP_DIR
   end
 
-  def get_dependencies target
-    dep_file_name = File.join(Settings::DEPS_DIR, Settings.encode_path(target))
-    return nil unless File.exist? dep_file_name
-    File.open(dep_file_name, "r") { |file| YAML::load_file dep_file_name }
-  end
-
-  def up_to_date target
-    return :outdated unless File.exist? target
-
-    dofiles = list_do_files(target).select { |bn, df| File.exist? df }
-    deps = get_dependencies target
-    unless deps.nil?
-      effective_do = deps[0][1]
-      ex_dos = list_do_files(target).take_while { |df| df[1] != effective_do }
-      ex_deps = ex_dos.map { |df| [:non_existing_dependency, df[1]] }
-      return collect (ex_deps + deps)
-    end
-    return :uptodate if dofiles.empty?
-    return :conflicted if !dofiles.empty?
-    raise "invalid dependency: #{target}"
-  end
-
-  def up_to_date2 target
-    case target[0]
-    when :non_existing_dependency
-      if File.exist? target[1]
-        return :outdated
-      else
-        return :uptodate
-      end
-
-    when :existing_dependency
-      if !File.exist?(target[1]) ||
-         target[2] != Settings::file_signature(target[1])
-        return :outdated
-      else
-        return up_to_date target[1]
-      end
-    end
-  end
-
-  def collect deps
-    return :uptodate if deps.nil? || deps.empty?
-
-    r = up_to_date2 deps[0]
-    return r unless r == :uptodate
-
-    return collect deps.drop 1
-  end
-
   def redo_for_ target
     indent = ' ' * Settings::CALL_DEPTH
     puts "visit #{indent + target}"
-    r = up_to_date(target)
+    r = ExistingDependency.new(target, nil).up_to_date
     puts "#{target} status = #{r}"
     return if r == :uptodate
 
@@ -134,8 +150,7 @@ class Redo
 
     run_do target, dofiles[0]
 
-    add_dependency Settings::DEPS_PATH, [:existing_dependency, target,
-                                         Settings::file_signature(target)]
+    add_dependency Settings::DEPS_PATH, ExistingDependency.new(target, Settings::file_signature(target))
   end
 
   def add_dependency dep_file, dep
@@ -151,8 +166,7 @@ class Redo
     tmp_out = File.join Settings::TEMP_DIR, target
     tmp_deps = Tempfile.new target, Settings::TEMP_OUT_DIR
     p "sh -vxe \"#{dofile[1]}\" \"#{dofile[0]}\" \"#{dofile[0]}\" \"#{tmp_out}\""
-    add_dependency tmp_deps, [:existing_dependency, dofile[1],
-                              Settings::file_signature(dofile[1])]
+    add_dependency tmp_deps, ExistingDependency.new(dofile[1], Settings::file_signature(dofile[1]))
     r = system(Settings.spawned_env(tmp_deps.path), "sh", "-ve",
                "#{dofile[1]}", "#{dofile[0]}", "#{dofile[0]}", "#{tmp_out}")
     if r
