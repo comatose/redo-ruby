@@ -121,7 +121,7 @@ def target_from_dir(base_dir, target)
   end
 end
 
-def redo_ target
+def redo_for target
   indent = ' ' * Settings::CALL_DEPTH
   puts "visit #{indent + target}"
   r = ExistingDependency.new(target, nil).up_to_date
@@ -161,16 +161,31 @@ def run_do target, dofile
   end
 end
 
-case $0
-when /.*(redo)(-ifchange)*$/
+def redo_ args
   FileUtils.mkdir_p Settings::TEMP_OUT_DIR
   FileUtils.mkdir_p Settings::DEPS_DIR
   begin
-    ARGV.each { |f| redo_ target_from_dir(Dir.pwd, f) }
+    args.each { |f| redo_for target_from_dir(Dir.pwd, f) }
   rescue Exception => e
     abort e.to_s
   end
   FileUtils.rm_rf Settings::TEMP_DIR
+end
+
+def redo_ifcreate args
+  FileUtils.mkdir_p Settings::TEMP_OUT_DIR
+  FileUtils.mkdir_p Settings::DEPS_DIR
+  begin
+    args.each { |f| redo_for target_from_dir(Dir.pwd, f) }
+  rescue Exception => e
+    abort e.to_s
+  end
+  FileUtils.rm_rf Settings::TEMP_DIR
+end
+
+case $0
+when /.*(redo)(-ifchange)*$/
+  redo_ ARGV
 else
   abort "unknown redo command"
 end
